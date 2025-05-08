@@ -2,26 +2,31 @@
 # https://cog.run/python
 
 import os
+import torch
+from typing import Optional
+from PIL import Image # ImageSequence is not used
+
+from cog import BasePredictor, Input, Path
+
+# Diffusers imports
+from diffusers import (
+    LTXPipeline,
+    LTXImageToVideoPipeline,
+    LTXVideoTransformer3DModel,
+    AutoencoderKLLTXVideo
+)
+from diffusers.utils import export_to_video
+# Transformers imports for T5 components are not strictly needed here
+# if relying on from_pretrained to load them as part of the pipeline.
+# from transformers import T5EncoderModel, T5Tokenizer
 
 MODEL_CACHE = "model_cache"
-BASE_URL = "https://weights.replicate.delivery/default/test-sd-15/model_cache/"
+BASE_URL = "https://weights.replicate.delivery/default/lightricks/ltx-video"
 os.environ["HF_HOME"] = MODEL_CACHE
 os.environ["TORCH_HOME"] = MODEL_CACHE
 os.environ["HF_DATASETS_CACHE"] = MODEL_CACHE
 os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE
 os.environ["HUGGINGFACE_HUB_CACHE"] = MODEL_CACHE
-
-import mimetypes
-
-mimetypes.add_type("image/webp", ".webp")
-
-import time
-import torch
-import subprocess
-from typing import Optional
-from cog import BasePredictor, Input, Path
-from diffusers import StableDiffusionPipeline
-
 
 def download_weights(url: str, dest: str) -> None:
     start = time.time()
@@ -41,96 +46,170 @@ def download_weights(url: str, dest: str) -> None:
     print("[+] Download completed in: ", time.time() - start, "seconds")
 
 
+
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        # Create model cache directory if it doesn't exist
         if not os.path.exists(MODEL_CACHE):
             os.makedirs(MODEL_CACHE)
+            print(f"Created cache directory: {MODEL_CACHE}")
 
-        model_files = [
-            "models--sd-legacy--stable-diffusion-v1-5.tar",
-        ]
+        dtype = torch.bfloat16  # LTX-Video recommended dtype
 
-        for model_file in model_files:
-            url = BASE_URL + model_file
-            filename = url.split("/")[-1]
-            dest_path = os.path.join(MODEL_CACHE, filename)
-            if not os.path.exists(dest_path.replace(".tar", "")):
-                download_weights(url, dest_path)
-
-        # Load the model
-        model_id = "sd-legacy/stable-diffusion-v1-5"
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            model_id, torch_dtype=torch.float16, cache_dir=MODEL_CACHE
+        # Load base pipelines to get compatible schedulers, tokenizers, and text encoders
+        print("Loading base TTV pipeline from Lightricks/LTX-Video...")
+        self.ttv_pipe = LTXPipeline.from_pretrained(
+            "Lightricks/LTX-Video", torch_dtype=dtype, cache_dir=MODEL_CACHE
         )
-        self.pipe = self.pipe.to("cuda")
+        print("Loading base I2V pipeline from Lightricks/LTX-Video...")
+        self.i2v_pipe = LTXImageToVideoPipeline.from_pretrained(
+            "Lightricks/LTX-Video", torch_dtype=dtype, cache_dir=MODEL_CACHE
+        )
+
+        # Define the specific 0.9.7 model file URL on Hugging Face Hub
+        model_file_hf_url = "https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-13b-0.9.7-dev.safetensors"
+
+        # Load the specific 0.9.7 VAE and Transformer components directly from HF Hub URL
+        # diffusers will handle downloading and caching to MODEL_CACHE
+        print(f"Loading VAE v0.9.7 from HF Hub: {model_file_hf_url}...")
+        vae_097 = AutoencoderKLLTXVideo.from_single_file(
+            model_file_hf_url, torch_dtype=dtype, cache_dir=MODEL_CACHE
+        )
+        # Replace the VAE in the loaded pipelines
+        self.ttv_pipe.vae = vae_097
+        self.i2v_pipe.vae = vae_097
+        print("VAE v0.9.7 loaded and replaced in pipelines.")
+
+        print(f"Loading Transformer v0.9.7 from HF Hub: {model_file_hf_url}...")
+        transformer_097 = LTXVideoTransformer3DModel.from_single_file(
+            model_file_hf_url, torch_dtype=dtype, cache_dir=MODEL_CACHE
+        )
+        # Replace the Transformer in the loaded pipelines
+        self.ttv_pipe.transformer = transformer_097
+        self.i2v_pipe.transformer = transformer_097
+        print("Transformer v0.9.7 loaded and replaced in pipelines.")
+        
+        # The text_encoder and tokenizer are inherited from the base pipelines loaded above.
+        # The scheduler is also part of the pipeline object.
+
+        self.ttv_pipe.to("cuda")
+        self.i2v_pipe.to("cuda")
+
+        self.export_to_video = export_to_video
+        print("Setup complete. LTX-Video 0.9.7 (13B) components configured from Hugging Face Hub.")
 
     def predict(
         self,
-        prompt: str = Input(description="Text prompt for image generation"),
+        prompt: str = Input(description="Text prompt for video generation"),
+        input_image: Optional[Path] = Input(
+            description="Input image for image-to-video generation. If not provided, text-to-video generation will be used.",
+            default=None
+        ),
+        negative_prompt: str = Input(
+            description="Negative prompt for video generation.",
+            default="worst quality, inconsistent motion, blurry, jittery, distorted"
+        ),
+        width: int = Input(
+            description="Width of the output video. Actual width will be a multiple of 32.",
+            default=704
+        ),
+        height: int = Input(
+            description="Height of the output video. Actual height will be a multiple of 32.",
+            default=480
+        ),
+        num_frames: int = Input(
+            description="Number of frames to generate. Actual frame count will be 8N+1 (e.g., 9, 17, 25, 161).",
+            default=161
+        ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps", ge=1, le=100, default=50
+            description="Number of denoising steps.",
+            default=50
         ),
         guidance_scale: float = Input(
-            description="Guidance scale for text conditioning",
+            description="Guidance scale. Recommended range: 3.0-3.5.",
+            default=3.0,
             ge=1.0,
-            le=20.0,
-            default=7.5,
+            le=10.0
+        ),
+        fps: int = Input(
+            description="Frames per second for the output video.",
+            default=24
         ),
         seed: Optional[int] = Input(
             description="Random seed for reproducible results. Leave blank for a random seed.",
-            default=None,
-        ),
-        output_format: str = Input(
-            description="Format of the output image",
-            choices=["webp", "jpg", "png"],
-            default="webp",
-        ),
-        output_quality: int = Input(
-            description="The image compression quality (for lossy formats like JPEG and WebP). 100 = best quality, 0 = lowest quality.",
-            ge=1,
-            le=100,
-            default=80,
+            default=None
         ),
     ) -> Path:
-        """Generate an image from a text prompt"""
-        # Set up generator with seed if provided
+        """Generate a video from a text prompt or an image+text prompt"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
+        generator = torch.Generator(device="cuda").manual_seed(seed)
 
-        # Generate image
-        image = self.pipe(
-            prompt=prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-        ).images[0]
+        # Adjust dimensions according to LTX-Video requirements
+        # Width and height must be divisible by 32
+        processed_width = (width // 32) * 32
+        processed_height = (height // 32) * 32
+        if processed_width == 0: processed_width = 32
+        if processed_height == 0: processed_height = 32
+        
+        # Number of frames must be 8N+1
+        # ((N-1)//F)*F + 1 ensures result >= 1 and is of the form K*F+1
+        processed_num_frames = ((num_frames - 1) // 8) * 8 + 1
+        if processed_num_frames <= 0: # Ensure at least 1 frame, typically 8*0+1 = 1
+            processed_num_frames = 1
 
-        # Ensure image is in RGB mode
-        if image.mode != "RGB":
-            image = image.convert("RGB")
 
-        # Prepare saving arguments
-        extension = output_format.lower()
-        save_params = {}
+        print(f"Original inputs: width={width}, height={height}, num_frames={num_frames}")
+        print(f"Processed inputs: width={processed_width}, height={processed_height}, num_frames={processed_num_frames}")
 
-        # Add quality parameter for lossy formats
-        if output_format != "png":
-            print(f"[~] Output quality: {output_quality}")
-            save_params["quality"] = output_quality
-            save_params["optimize"] = True
+        video_frames_tensor = None
 
-        # Handle jpg/jpeg naming
-        if extension == "jpg":
-            extension = "jpeg"
+        if input_image:
+            print(f"[~] Mode: Image-to-Video")
+            print(f"[~] Loading input image from: {input_image}")
+            try:
+                pil_image = Image.open(str(input_image)).convert("RGB")
+                pil_image = pil_image.resize((processed_width, processed_height), Image.Resampling.LANCZOS)
+                print(f"[~] Resized input image to: {processed_width}x{processed_height}")
+            except Exception as e:
+                raise ValueError(f"Failed to load or resize input image: {e}")
 
-        # Create output path
-        output_path = Path(f"output.{extension}")
+            print(f"[~] Generating video with prompt: '{prompt}'")
+            video_frames_tensor = self.i2v_pipe(
+                prompt=prompt,
+                image=pil_image,
+                negative_prompt=negative_prompt,
+                width=processed_width,
+                height=processed_height,
+                num_frames=processed_num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            ).frames[0]
+        else:
+            print(f"[~] Mode: Text-to-Video")
+            print(f"[~] Generating video with prompt: '{prompt}'")
+            video_frames_tensor = self.ttv_pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=processed_width,
+                height=processed_height,
+                num_frames=processed_num_frames,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            ).frames[0]
 
-        # Save the image with appropriate parameters
-        image.save(str(output_path), **save_params)
-        print(f"[+] Saved output as {output_format.upper()}")
+        # Define output path
+        output_video_path_str = "output.mp4"
 
-        return output_path
+        print(f"[~] Exporting video to {output_video_path_str} with {fps} FPS...")
+        # export_to_video expects video_frames_tensor to be (num_frames, height, width, channels)
+        # or a list of PIL Images. LTXPipeline output is typically compatible.
+        self.export_to_video(video_frames_tensor, output_video_path_str, fps=fps)
+
+        print(f"[+] Video generation complete: {output_video_path_str}")
+        return Path(output_video_path_str)

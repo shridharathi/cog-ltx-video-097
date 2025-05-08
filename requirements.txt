@@ -1,4 +1,7 @@
 torch
 diffusers
 transformers
+sentencepiece
 accelerate
+Pillow
+imageio[ffmpeg]
